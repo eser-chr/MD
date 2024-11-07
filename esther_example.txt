@@ -1,0 +1,226 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+def periodic(coor, ndim, l):
+    for i in range(ndim):
+        if coor[i] >= 0.5*l[i]:
+            coor[i] -= l[i]
+        elif coor[i] < -0.5*l[i]:
+            coor[i] += l[i]
+    return coor
+
+def periodic_all(coors, n, ndim, l):
+    for i in range(n):
+        coors[i]=periodic(coors[i], ndim, l)
+    return coors
+
+def soft_sphere(rij_squared): 
+    rij_squared_inv = 1/rij_squared
+    rij_six_inv = rij_squared_inv**3
+    f_val = 48 * rij_six_inv * rij_squared_inv * (rij_six_inv - 0.5)
+    e_val = 4 * rij_six_inv * (rij_six_inv - 1) + 1
+    return f_val, e_val
+                
+def compute_forces(coors, n, ndim, rcut_squared, l):
+    accels = np.zeros((n, ndim))
+    sum_pot = 0
+    sum_vir = 0
+    n_pairs = 0
+    for i in range(n-1):
+        for j in range(i+1, n):
+            n_pairs += 1
+            vect_rij = periodic(coors[i]-coors[j], ndim, l)
+            rij_squared = np.sum(vect_rij**2)
+            if rij_squared < rcut_squared:
+                f_val, e_val = soft_sphere(rij_squared)
+                accels[i] += f_val * vect_rij
+                accels[j] -= f_val * vect_rij
+                sum_pot += e_val
+                sum_vir += f_val * rij_squared
+    return accels, sum_pot, sum_vir, n_pairs
+
+def compute_forces_cell_subdivision(coors, n, ndim, rcut_squared, l, lcell, ncell):
+    accels = np.zeros((n, ndim))
+    sum_pot = 0
+    sum_vir = 0
+    cells = np.array((coors+l/2)//lcell,'int')
+    cells = [(c[0],c[1]) for c in cells]
+    n_pairs = 0
+    for mx in range(ncell[0]):
+        for my in range(ncell[1]):
+            mxp1=int((mx+1)%ncell[0])
+            myp1=int((my+1)%ncell[1])
+            mym1=int((my-1)%ncell[1])
+            cond = [(mxp1, mym1), (mxp1,my), (mxp1,myp1), (mx, myp1)]
+            idxs_center = [idx for idx, c in enumerate(cells) if c==(mx,my)]
+            idxs_surr = [idx for idx, c in enumerate(cells) if c in cond]
+            for ii,i in enumerate(idxs_center):
+                for j in idxs_center[ii+1:]+idxs_surr:
+                    n_pairs += 1
+                    vect_rij = periodic(coors[i]-coors[j], ndim, l)
+                    rij_squared = np.sum(vect_rij**2)
+                    if rij_squared < rcut_squared:
+                        f_val, e_val = soft_sphere(rij_squared)
+                        accels[i] += f_val * vect_rij
+                        accels[j] -= f_val * vect_rij
+                        sum_pot += e_val
+                        sum_vir += f_val * rij_squared
+    return accels, sum_pot, sum_vir, n_pairs
+
+def compute_forces_neighbor_list(coors, n, ndim, rcut_squared, l, lcell, ncell, refresh, rcut_dr_squared, neighbors):
+    accels = np.zeros((n, ndim))
+    sum_pot = 0
+    sum_vir = 0
+    n_pairs = 0
+    if refresh:
+        cells = np.array((coors+l/2)//lcell,'int')
+        cells = [(c[0],c[1]) for c in cells]
+        for mx in range(ncell[0]):
+            for my in range(ncell[1]):
+                mxp1=int((mx+1)%ncell[0])
+                myp1=int((my+1)%ncell[1])
+                mym1=int((my-1)%ncell[1])
+                cond = [(mxp1, mym1), (mxp1,my), (mxp1,myp1), (mx, myp1)]
+                idxs_i = [idx for idx, c in enumerate(cells) if c==(mx,my)]
+                idxs_j = [idx for idx, c in enumerate(cells) if c in cond]
+                for ii,i in enumerate(idxs_i):
+                    for j in idxs_i[ii+1:]+idxs_j:
+                        n_pairs += 1
+                        vect_rij = periodic(coors[i]-coors[j], ndim, l)
+                        rij_squared = np.sum(vect_rij**2)
+                        if rij_squared < rcut_dr_squared:
+                            if i<j:
+                                neighbors[i, j] = True
+                            else:
+                                neighbors[j, i] = True
+                        else:
+                            if i<j:
+                                neighbors[i, j] = False
+                            else:
+                                neighbors[j, i] = False
+                        if rij_squared < rcut_squared:
+                            f_val, e_val = soft_sphere(rij_squared)
+                            accels[i] += f_val * vect_rij
+                            accels[j] -= f_val * vect_rij
+                            sum_pot += e_val
+                            sum_vir += f_val * rij_squared
+        refresh=False
+        return accels, sum_pot, sum_vir, n_pairs, neighbors, refresh
+        
+    for i in range(n-1):
+        for j in range(i+1, n):
+            if not neighbors[i, j]:
+                continue
+            n_pairs += 1
+            vect_rij = periodic(coors[i]-coors[j], ndim, l)
+            rij_squared = np.sum(vect_rij**2)
+            if rij_squared < rcut_squared:
+                f_val, e_val = soft_sphere(rij_squared)
+                accels[i] += f_val * vect_rij
+                accels[j] -= f_val * vect_rij
+                sum_pot += e_val
+                sum_vir += f_val * rij_squared
+    return accels, sum_pot, sum_vir, n_pairs, neighbors, refresh
+
+#Use adapted Leapfrog that gives velocities and positions at the same timestep
+#The process then becomes 2 steps
+def leapfrog_1(r, v, a, dt):
+    v_new = v + 0.5*dt*a
+    r_new = r + dt*v_new
+    return r_new, v_new
+
+def leapfrog_2(v, a, dt):
+    v_new = v + 0.5*dt*a
+    return v_new
+
+def initcoords(n, ndim, l, ucell):
+    coords = np.zeros((n, ndim))
+    i=0
+    if ndim==2:
+        for x in np.arange(-l[0]/2, l[0]/2, l[0]/ucell[0]):
+            for y in np.arange(-l[1]/2, l[1]/2, l[1]/ucell[1]):
+                coords[i] = np.array([x,y])
+                i+=1
+                if i == n:
+                    break     
+    return coords
+
+def initvels(n, ndim, temp, seed):
+    np.random.seed(seed) 
+    vels = np.random.random((n,ndim))-np.ones((n,ndim))*0.5
+    vels = vels/np.linalg.norm(vels, axis=1)[:,None]* np.sqrt(temp*ndim*(1-1/n))
+    vels -= np.sum(vels, axis=0)/n
+    return vels
+
+def init(n, ndim, l, ucell, temp, seed):
+    step_count = 0
+    coors = initcoords(n, ndim, l, ucell)
+    vels = initvels(n, ndim, temp, seed)
+    accels = np.zeros((n, ndim))
+    return step_count, coors, vels, accels
+            
+def single_step(step_count, coors, vels, accels, density, n, ndim, rcut_squared, l, temp, nprint, dt, method, lcell, ncell, refresh, rcut_dr_squared, neighbors):
+    #step1 leapfrog
+    coors, vels = leapfrog_1(coors, vels, accels, dt) 
+    coors = periodic_all(coors, n, ndim, l)
+
+    #compute forces
+    if method == 'all_pair':
+        accels, sum_pot, sum_vir, n_pairs = compute_forces(coors, n, ndim, rcut_squared, l)
+    elif method == 'cell_subdivision':
+        accels, sum_pot, sum_vir, n_pairs = compute_forces_cell_subdivision(coors, n, ndim, rcut_squared, l, lcell, ncell)
+    elif method == 'neighbor_list':
+        accels, sum_pot, sum_vir, n_pairs, neighbors, refresh = compute_forces_neighbor_list(coors, n, ndim, rcut_squared, l, lcell, ncell, refresh, rcut_dr_squared, neighbors)
+    else:
+        raise NotImplentedError("Unknown method")
+
+    #step2 leapfrog
+    vels = leapfrog_2(vels, accels, dt)
+    
+    kin_energy = 0.5*np.sum(vels**2)/n #per atom
+    pot_energy = sum_pot/n #per atom
+    tot_energy = kin_energy + pot_energy #per atom
+    temp = 2*kin_energy/ndim
+    total_vel = np.linalg.norm(np.sum(vels,axis=0))
+    pressure = density*(total_vel**2 + sum_vir) / (n*ndim)
+
+    
+    if step_count%nprint == 0:
+        print("%7i %7.3f %7.3f %7.3f %7.3f %7.3f %7i" % (step_count,
+                                               kin_energy,
+                                               pot_energy,
+                                               tot_energy,
+                                               temp,
+                                               pressure,
+                                               n_pairs))
+    step_count += 1
+    return step_count, coors, vels, accels, refresh, neighbors
+
+def simulation(ucell, rcut, temp, density, dt, steps, nprint, method, dr=0.3, seed=0):
+    n = np.prod(ucell)
+    ndim = ucell.shape[0]
+    if ndim!=2:
+        raise NotImplementedError("Ndim other than 2 not implemented currently")
+    l = 1/np.sqrt(density)*ucell
+    rcut_squared = rcut**2
+    ncell = np.array(np.floor(l/rcut),'int')
+    lcell = l/ncell
+    refresh = True
+    cum_max_vels = 0
+    neighbors = np.zeros((n, n), dtype='bool')
+    rcut_dr_squared = (rcut+dr)**2
+    
+    print("%7s %7s %7s %7s %7s %7s %7s" % ("Step", "E_k", "E_pot", "E_tot", "T", "P", "Eval r"))
+    traj=[]
+    traj_v=[]
+    step_count, coors, vels, accels = init(n, ndim, l, ucell, temp, seed)
+    for _ in range(steps):
+        if cum_max_vels > dr/(2*dt):
+            refresh=True
+            cum_max_vels = 0
+        step_count, coors, vels, accels, refresh, neighbors = single_step(step_count, coors, vels, accels, density, n, ndim, rcut_squared, l, temp, nprint, dt, method, lcell, ncell, refresh, rcut_dr_squared, neighbors)
+        cum_max_vels += np.max(np.linalg.norm(vels, axis=1))
+        traj.append(coors)
+        traj_v.append(vels)
+    return traj, traj_v
